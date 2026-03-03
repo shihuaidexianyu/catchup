@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QColorDialog
 )
 
+from buzz.catch_up_summarizer import CatchUpSummaryJob, DEFAULT_CATCH_UP_PROMPT
 from buzz.dialogs import show_model_download_error_dialog
 from buzz.locale import _
 from buzz.model_loader import (
@@ -48,6 +49,7 @@ from buzz.transcriber.transcriber import (
 from buzz.translator import Translator
 from buzz.widgets.audio_devices_combo_box import AudioDevicesComboBox
 from buzz.widgets.audio_meter_widget import AudioMeterWidget
+from buzz.widgets.catch_up_dialog import CatchUpDialog
 from buzz.widgets.model_download_progress_dialog import ModelDownloadProgressDialog
 from buzz.widgets.record_button import RecordButton
 from buzz.widgets.text_display_box import TextDisplayBox
@@ -62,6 +64,7 @@ NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
 
 
 class RecordingTranscriberWidget(QWidget):
+    CATCH_UP_MAX_CHARS = 6000
     current_status: "RecordingStatus"
     transcription_options: TranscriptionOptions
     selected_device_id: Optional[int]
@@ -96,10 +99,16 @@ class RecordingTranscriberWidget(QWidget):
         self.translator = None
         self.transcripts = []
         self.translations = []
+        self._chunk_log: list[tuple[float, str]] = []
+        self.catch_up_summary_job: Optional[CatchUpSummaryJob] = None
         self.current_status = self.RecordingStatus.STOPPED
         self.setWindowTitle(_("Live Recording"))
 
         self.settings = Settings()
+        self.catch_up_enabled = self.settings.value(
+            key=Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_ENABLED,
+            default_value=True,
+        )
         self.transcriber_mode = list(RecordingTranscriberMode)[
             self.settings.value(key=Settings.Key.RECORDING_TRANSCRIBER_MODE, default_value=0)]
 
@@ -315,6 +324,35 @@ class RecordingTranscriberWidget(QWidget):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(10)
 
+        self.catch_up_window_combo_box = None
+        self.catch_up_button = None
+        if self.catch_up_enabled:
+            self.catch_up_window_combo_box = QComboBox(bar)
+            self.catch_up_window_combo_box.addItem(_("Last 2 min"), 120)
+            self.catch_up_window_combo_box.addItem(_("Last 5 min"), 300)
+            saved_window_seconds = self.settings.value(
+                Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_WINDOW_SECONDS,
+                120,
+                int,
+            )
+            selected_index = self.catch_up_window_combo_box.findData(saved_window_seconds)
+            if selected_index == -1:
+                label = _("Last {minutes} min").format(
+                    minutes=max(saved_window_seconds // 60, 1)
+                )
+                self.catch_up_window_combo_box.addItem(label, saved_window_seconds)
+                selected_index = self.catch_up_window_combo_box.count() - 1
+            self.catch_up_window_combo_box.setCurrentIndex(selected_index)
+            self.catch_up_window_combo_box.currentIndexChanged.connect(
+                self.on_catch_up_window_changed
+            )
+            layout.addWidget(self.catch_up_window_combo_box)
+
+            self.catch_up_button = QPushButton(_("Catch up"), bar)
+            self.catch_up_button.setToolTip(_("Summarize the most recent transcript"))
+            self.catch_up_button.clicked.connect(self.on_catch_up_clicked)
+            layout.addWidget(self.catch_up_button)
+
         layout.addStretch()  # Push button to the right
 
         self.copy_transcript_button = QPushButton(_("Copy"), bar)
@@ -357,6 +395,169 @@ class RecordingTranscriberWidget(QWidget):
 
         self.copy_transcript_button.setText(_("Copied!"))
         QTimer.singleShot(2000, lambda: self.copy_transcript_button.setText(_("Copy")))
+
+    def on_catch_up_window_changed(self):
+        if self.catch_up_window_combo_box is None:
+            return
+
+        window_seconds = self.catch_up_window_combo_box.currentData()
+        if window_seconds is None:
+            return
+
+        self.settings.set_value(
+            Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_WINDOW_SECONDS,
+            int(window_seconds),
+        )
+
+    def on_catch_up_clicked(self):
+        if self.catch_up_button is None or self.catch_up_summary_job is not None:
+            return
+
+        recent_text = self.get_recent_text(self.get_catch_up_window_seconds())
+        if not recent_text:
+            QMessageBox.information(
+                self,
+                _("Catch up"),
+                _("No recent transcript is available for the selected window yet."),
+            )
+            return
+
+        model_name = self.settings.value(
+            Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_LLM_MODEL,
+            self.settings.value(
+                Settings.Key.RECORDING_TRANSCRIBER_LLM_MODEL,
+                "",
+            ),
+        ).strip()
+        api_key = os.getenv(
+            "BUZZ_TRANSLATION_API_KEY",
+            get_password(Key.OPENAI_API_KEY),
+        )
+
+        if not model_name:
+            QMessageBox.warning(
+                self,
+                _("Catch up unavailable"),
+                _(
+                    "Catch up needs an LLM model. Set the catch up model in the "
+                    "'recording-transcriber/catchup-llm-model' setting, or configure "
+                    "the recording LLM model first."
+                ),
+            )
+            return
+
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                _("Catch up unavailable"),
+                _(
+                    "Catch up needs an API key. Open Preferences and set the OpenAI API key "
+                    "under General before trying again."
+                ),
+            )
+            return
+
+        prompt = self.settings.value(
+            Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_LLM_PROMPT,
+            DEFAULT_CATCH_UP_PROMPT,
+        ).strip() or DEFAULT_CATCH_UP_PROMPT
+        base_url = os.getenv(
+            "BUZZ_TRANSLATION_API_BASE_URl",
+            self.settings.value(
+                Settings.Key.CUSTOM_OPENAI_BASE_URL,
+                "",
+            ),
+        )
+        recent_text = recent_text[-self.CATCH_UP_MAX_CHARS:]
+
+        self.catch_up_summary_job = CatchUpSummaryJob(
+            transcript=recent_text,
+            model=model_name,
+            prompt=prompt,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        self.catch_up_summary_job.signals.success.connect(self.on_catch_up_summary_ready)
+        self.catch_up_summary_job.signals.failed.connect(self.on_catch_up_summary_failed)
+        self.catch_up_button.setEnabled(False)
+        self.catch_up_button.setText(_("Summarizing..."))
+        QThreadPool().globalInstance().start(self.catch_up_summary_job)
+
+    def on_catch_up_summary_ready(self, summary: str):
+        self.catch_up_summary_job = None
+        if self.catch_up_button is not None:
+            self.catch_up_button.setEnabled(True)
+            self.catch_up_button.setText(_("Catch up"))
+
+        dialog = CatchUpDialog(summary, self)
+        dialog.exec()
+
+    def on_catch_up_summary_failed(self, error: str):
+        self.catch_up_summary_job = None
+        if self.catch_up_button is not None:
+            self.catch_up_button.setEnabled(True)
+            self.catch_up_button.setText(_("Catch up"))
+
+        QMessageBox.warning(
+            self,
+            _("Catch up failed"),
+            _(
+                "The summary request did not complete. Check the model, base URL, and API key."
+            ) + "\n\n" + error,
+        )
+
+    def get_catch_up_window_seconds(self) -> int:
+        if self.catch_up_window_combo_box is not None:
+            window_seconds = self.catch_up_window_combo_box.currentData()
+            if window_seconds is not None:
+                return int(window_seconds)
+
+        return self.settings.value(
+            Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_WINDOW_SECONDS,
+            120,
+            int,
+        )
+
+    def append_chunk_log(self, text: str):
+        timestamp = time.time()
+        self._chunk_log.append((timestamp, text))
+        cutoff = timestamp - 1800
+        self._chunk_log = [
+            (chunk_time, chunk_text)
+            for chunk_time, chunk_text in self._chunk_log
+            if chunk_time >= cutoff
+        ]
+
+    def get_recent_text(self, window_seconds: int) -> str:
+        cutoff = time.time() - window_seconds
+        recent_chunks = [
+            text
+            for chunk_time, text in self._chunk_log
+            if chunk_time >= cutoff
+        ]
+        return self.merge_chunk_texts(recent_chunks)
+
+    def merge_chunk_texts(self, texts: list[str]) -> str:
+        if not texts:
+            return ""
+
+        merged_chunks = texts.copy()
+        for i in range(len(merged_chunks) - 1):
+            common_part = self.find_common_part(merged_chunks[i], merged_chunks[i + 1])
+            if common_part:
+                common_length = len(common_part)
+                merged_chunks[i] = merged_chunks[i][
+                    : merged_chunks[i].rfind(common_part) + common_length
+                ]
+                merged_chunks[i + 1] = merged_chunks[i + 1][
+                    merged_chunks[i + 1].find(common_part):
+                ]
+
+        merged_text = ""
+        for chunk_text in merged_chunks:
+            merged_text = self.merge_text_no_overlap(merged_text, chunk_text)
+
+        return NO_SPACE_BETWEEN_SENTENCES.sub(r'\1 \2', merged_text).strip()
 
     def on_show_presentation_clicked(self):
         """Handle click on 'Show in new window' button"""
@@ -568,7 +769,10 @@ class RecordingTranscriberWidget(QWidget):
             self.transcription_options_group_box.setEnabled(False)
             self.audio_devices_combo_box.setEnabled(False)
             self.presentation_options_bar.show()
-            self.copy_actions_bar.hide()
+            if self.catch_up_enabled:
+                self.copy_actions_bar.show()
+            else:
+                self.copy_actions_bar.hide()
 
         else:  # RecordingStatus.RECORDING
             self.stop_recording()
@@ -579,6 +783,7 @@ class RecordingTranscriberWidget(QWidget):
         self.record_button.setDisabled(True)
         self.transcripts = []
         self.translations = []
+        self._chunk_log = []
 
         self.transcription_text_box.clear()
         self.translation_text_box.clear()
@@ -883,6 +1088,8 @@ class RecordingTranscriberWidget(QWidget):
 
         if len(text) == 0:
             return
+
+        self.append_chunk_log(text)
 
         if self.translator is not None:
             self.translator.enqueue(text)

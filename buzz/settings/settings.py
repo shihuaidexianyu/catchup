@@ -31,6 +31,10 @@ class Settings:
         RECORDING_TRANSCRIBER_EXPORT_FILE_TYPE = "recording-transcriber/export-file-type"
         RECORDING_TRANSCRIBER_EXPORT_MAX_ENTRIES = "recording-transcriber/export-max-entries"
         RECORDING_TRANSCRIBER_EXPORT_FILE_NAME = "recording-transcriber/export-file-name"
+        RECORDING_TRANSCRIBER_CATCHUP_ENABLED = "recording-transcriber/catchup-enabled"
+        RECORDING_TRANSCRIBER_CATCHUP_WINDOW_SECONDS = "recording-transcriber/catchup-window-seconds"
+        RECORDING_TRANSCRIBER_CATCHUP_LLM_MODEL = "recording-transcriber/catchup-llm-model"
+        RECORDING_TRANSCRIBER_CATCHUP_LLM_PROMPT = "recording-transcriber/catchup-llm-prompt"
 
         PRESENTATION_WINDOW_TEXT_COLOR = "presentation-window/text-color"
         PRESENTATION_WINDOW_BACKGROUND_COLOR = "presentation-window/background-color"

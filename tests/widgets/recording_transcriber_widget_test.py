@@ -192,6 +192,49 @@ class TestRecordingTranscriberWidget:
 
             widget.close()
 
+    @pytest.mark.timeout(60)
+    def test_on_next_transcription_appends_chunk_log(self, qtbot: QtBot):
+        with _widget_ctx(qtbot) as widget:
+            with patch("buzz.widgets.recording_transcriber_widget.time.time", return_value=100.0):
+                widget.on_next_transcription("hello")
+
+            assert widget._chunk_log == [(100.0, "hello")]
+
+    @pytest.mark.timeout(60)
+    def test_get_recent_text_merges_recent_chunks(self, qtbot: QtBot):
+        with _widget_ctx(qtbot) as widget:
+            widget._chunk_log = [
+                (100.0, "older text"),
+                (220.0, "Hello world."),
+                (260.0, "world. Goodbye."),
+            ]
+
+            with patch("buzz.widgets.recording_transcriber_widget.time.time", return_value=300.0):
+                assert widget.get_recent_text(120) == "Hello world. Goodbye."
+
+    @pytest.mark.timeout(60)
+    def test_on_catch_up_clicked_requires_model(self, qtbot: QtBot):
+        def fake_settings_value(key, default_value, *args):
+            if key == Settings.Key.RECORDING_TRANSCRIBER_CATCHUP_LLM_MODEL:
+                return ""
+            return default_value
+
+        with _widget_ctx(qtbot) as widget, \
+                patch.object(widget, "get_recent_text", return_value="hello"), \
+                patch(
+                    "buzz.widgets.recording_transcriber_widget.get_password",
+                    return_value="test-key",
+                ), \
+                patch.object(
+                    widget.settings,
+                    "value",
+                    side_effect=fake_settings_value,
+                ), \
+                patch("buzz.widgets.recording_transcriber_widget.QMessageBox.warning") as mock_warning:
+            widget.catch_up_button = MagicMock()
+            widget.on_catch_up_clicked()
+            mock_warning.assert_called_once()
+
 
 class TestRecordingTranscriberWidgetLineSeparator:
     @pytest.mark.timeout(60)
@@ -611,8 +654,8 @@ class TestRecordingTranscriberWidgetPresentation:
             widget.close()
 
     @pytest.mark.timeout(60)
-    def test_copy_actions_bar_hidden_when_recording_starts(self, qtbot: QtBot):
-        """Test that copy actions bar hides when recording starts"""
+    def test_copy_actions_bar_shown_when_recording_starts(self, qtbot: QtBot):
+        """Test that copy actions bar stays visible so Catch up can be used while recording"""
         with (
             patch("sounddevice.InputStream", side_effect=MockInputStream),
             patch("sounddevice.check_input_settings"),
@@ -623,6 +666,7 @@ class TestRecordingTranscriberWidgetPresentation:
                 custom_sounddevice=MockSoundDevice()
             )
             widget.device_sample_rate = 16_000
+            widget.catch_up_enabled = True
             qtbot.add_widget(widget)
 
             widget.copy_actions_bar.show()
@@ -633,7 +677,7 @@ class TestRecordingTranscriberWidgetPresentation:
             with patch.object(widget, 'start_recording'):
                 widget.on_record_button_clicked()
 
-            assert widget.copy_actions_bar.isHidden()
+            assert not widget.copy_actions_bar.isHidden()
 
             time.sleep(0.5)
             widget.close()
